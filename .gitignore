@@ -1,0 +1,22 @@
+# Generated verification output
+self-test.json
+scan-report.json
+
+# Superseded design previews
+ui-preview-black.png
+ui-preview-soft-black.png
+
+# Local build artifacts except the distributed executable
+bin/
+obj/
+*.pdb
+*.tmp
+*.log
+
+# IDE and OS metadata
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
