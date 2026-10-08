@@ -21,7 +21,7 @@ $references = @(
     'System.Windows.Forms.dll'
 )
 
-Add-Type -Path $sourcePath `
+Add-Type -Path @($sourcePath, (Join-Path $projectRoot 'Engine.cs'), (Join-Path $projectRoot 'SafetyTests.cs')) `
     -ReferencedAssemblies $references `
     -OutputAssembly $outputPath `
     -OutputType WindowsApplication

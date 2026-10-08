@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题
+    url: https://github.com/bogao6769-netizen/c-drive-cache-cleaner/blob/main/SECURITY.md
+    about: 越界删除、路径绕过等问题请先阅读安全报告流程。

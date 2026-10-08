@@ -1,6 +1,8 @@
 # Generated verification output
 self-test.json
 scan-report.json
+ui-test/
+artifacts/
 
 # Superseded design previews
 ui-preview-black.png

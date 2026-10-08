@@ -12,12 +12,12 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
-
+using System.Threading;
 [assembly: AssemblyTitle("C盘缓存清理器")]
 [assembly: AssemblyDescription("先扫描、后确认的安全型 Windows 缓存清理工具")]
 [assembly: AssemblyCompany("Local Utility")]
 [assembly: AssemblyProduct("C盘缓存清理器")]
-[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
 
 namespace CDriveCacheCleaner
 {
@@ -55,6 +55,10 @@ namespace CDriveCacheCleaner
         public bool Selected;
         public long SizeBytes;
         public string Status;
+        public int CandidateCount;
+        public int ProtectedCount;
+        public int ScanErrors;
+        public List<FileEntry> Entries = new List<FileEntry>();
         public readonly List<CleanupRule> Rules = new List<CleanupRule>();
     }
 
@@ -63,14 +67,18 @@ namespace CDriveCacheCleaner
         public long FreeBefore;
         public long FreeAfter;
         public int DeletedFiles;
-        public int RemovedDirectories;
         public int SkippedItems;
         public string ErrorMessage;
-
-        public long FreedBytes
+        public long EstimatedBytes;
+        public long DeletedBytes;
+        public bool Cancelled;
+        public readonly List<Outcome> Outcomes = new List<Outcome>();
+        public string SummaryStatus
         {
-            get { return Math.Max(0L, FreeAfter - FreeBefore); }
+            get { return Cancelled ? "已停止" : (!String.IsNullOrEmpty(ErrorMessage) ? "失败" :
+                (SkippedItems > 0 ? "部分完成" : "完成")); }
         }
+
     }
 
     internal static class FormatUtil
@@ -106,7 +114,8 @@ namespace CDriveCacheCleaner
         public SafetyPolicy(string testRoot)
         {
             _localAppData = Normalize(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
-            _userTemp = Normalize(Path.GetTempPath());
+            // Never trust an arbitrary TEMP environment override as a deletion root.
+            _userTemp = Normalize(Path.Combine(_localAppData, "Temp"));
             _windowsTemp = Normalize(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Temp"));
             _testRoot = String.IsNullOrEmpty(testRoot) ? null : Normalize(testRoot);
             _exactRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -131,7 +140,8 @@ namespace CDriveCacheCleaner
 
         public static string Normalize(string path)
         {
-            return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string full = Path.GetFullPath(path);
+            return full.Length == Path.GetPathRoot(full).Length ? full : full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         }
 
         public bool IsApprovedRoot(string path)
@@ -183,6 +193,23 @@ namespace CDriveCacheCleaner
             try { return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0; }
             catch { return true; }
         }
+
+        public bool HasSafeChain(string path)
+        {
+            try
+            {
+                string current = Normalize(path);
+                while (!String.IsNullOrEmpty(current))
+                {
+                    FileAttributes attributes = File.GetAttributes(current);
+                    if ((attributes & FileAttributes.ReparsePoint) != 0) return false;
+                    DirectoryInfo parent = Directory.GetParent(current);
+                    current = parent == null ? null : parent.FullName;
+                }
+                return true;
+            }
+            catch { return false; }
+        }
     }
 
     internal static class CleanerCatalog
@@ -190,7 +217,7 @@ namespace CDriveCacheCleaner
         public static List<CleanupTarget> Build(int retentionHours)
         {
             string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            string temp = Path.GetTempPath();
+            string temp = Path.Combine(local, "Temp");
             string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
             List<CleanupTarget> targets = new List<CleanupTarget>();
 
@@ -226,15 +253,15 @@ namespace CDriveCacheCleaner
 
             CleanupTarget shader = NewTarget("shader", "图形缓存", "DirectX / NVIDIA 着色器",
                 "显卡驱动编译生成的着色器缓存，游戏和设计软件会按需重建。",
-                "可安全重新生成", true);
+                "应用会按需重建", true);
             shader.Rules.Add(All(Path.Combine(local, "D3DSCache")));
             shader.Rules.Add(All(Path.Combine(local, "NVIDIA", "DXCache")));
             shader.Rules.Add(All(Path.Combine(local, "NVIDIA", "GLCache")));
             targets.Add(shader);
 
             CleanupTarget crash = NewTarget("crash", "诊断文件", "崩溃转储与错误报告",
-                "软件崩溃时生成的诊断文件。若近期正在排查故障，可取消勾选。",
-                "删除后不可用于故障分析", true);
+                "原始崩溃信息不能重新生成，诊断文件默认保留。",
+                "诊断记录，默认不清理", false);
             crash.Rules.Add(All(Path.Combine(local, "CrashDumps")));
             crash.Rules.Add(Older(Path.Combine(local, "Microsoft", "Windows", "WER", "ReportArchive"), retentionHours, null));
             crash.Rules.Add(Older(Path.Combine(local, "Microsoft", "Windows", "WER", "ReportQueue"), retentionHours, null));
@@ -304,258 +331,6 @@ namespace CDriveCacheCleaner
         }
     }
 
-    internal sealed class CleanerEngine
-    {
-        private readonly SafetyPolicy _policy;
-
-        public CleanerEngine() : this(new SafetyPolicy()) { }
-
-        private CleanerEngine(SafetyPolicy policy)
-        {
-            _policy = policy;
-        }
-
-        public void Scan(IList<CleanupTarget> targets, Action<int, CleanupTarget> progress)
-        {
-            for (int i = 0; i < targets.Count; i++)
-            {
-                CleanupTarget target = targets[i];
-                long total = 0L;
-                int validRoots = 0;
-                foreach (CleanupRule rule in target.Rules)
-                {
-                    if (!_policy.IsApprovedRoot(rule.RootPath)) continue;
-                    validRoots++;
-                    total += ScanRule(rule);
-                }
-                target.SizeBytes = total;
-                target.Status = validRoots == 0 ? "未发现缓存目录" : (total > 0 ? "可清理" : "已是干净");
-                if (progress != null) progress(i + 1, target);
-            }
-        }
-
-        private long ScanRule(CleanupRule rule)
-        {
-            if (!Directory.Exists(rule.RootPath)) return 0L;
-            long total = 0L;
-            foreach (FileInfo file in EnumerateCandidateFiles(rule))
-            {
-                try { total += file.Length; }
-                catch { }
-            }
-            return total;
-        }
-
-        public CleanResult Clean(IList<CleanupTarget> targets, Action<string> progress)
-        {
-            CleanResult result = new CleanResult();
-            result.FreeBefore = GetCDriveFreeSpace();
-            try
-            {
-                foreach (CleanupTarget target in targets)
-                {
-                    if (progress != null) progress("正在清理：" + target.Name);
-                    foreach (CleanupRule rule in target.Rules)
-                    {
-                        if (!_policy.IsApprovedRoot(rule.RootPath))
-                        {
-                            result.SkippedItems++;
-                            AppLog.Write("拒绝未批准路径：" + rule.RootPath);
-                            continue;
-                        }
-                        DeleteRule(rule, result);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                result.ErrorMessage = ex.Message;
-                AppLog.Write("清理异常：" + ex);
-            }
-            result.FreeAfter = GetCDriveFreeSpace();
-            return result;
-        }
-
-        private void DeleteRule(CleanupRule rule, CleanResult result)
-        {
-            if (!Directory.Exists(rule.RootPath)) return;
-            List<FileInfo> candidates = EnumerateCandidateFiles(rule).ToList();
-            foreach (FileInfo file in candidates)
-            {
-                if (!_policy.IsSafeDescendant(rule.RootPath, file.FullName) || _policy.IsReparsePoint(file.FullName))
-                {
-                    result.SkippedItems++;
-                    continue;
-                }
-                try
-                {
-                    if (file.IsReadOnly) file.IsReadOnly = false;
-                    file.Delete();
-                    result.DeletedFiles++;
-                }
-                catch { result.SkippedItems++; }
-            }
-            RemoveEmptyDirectories(rule, result);
-        }
-
-        private IEnumerable<FileInfo> EnumerateCandidateFiles(CleanupRule rule)
-        {
-            List<FileInfo> files = new List<FileInfo>();
-            if (!Directory.Exists(rule.RootPath) || !_policy.IsApprovedRoot(rule.RootPath)) return files;
-            DateTime cutoff = DateTime.UtcNow.AddHours(-Math.Max(1, rule.RetentionHours));
-
-            if (rule.Mode == CleanupMode.MatchingFiles)
-            {
-                try
-                {
-                    DirectoryInfo rootInfo = new DirectoryInfo(rule.RootPath);
-                    foreach (FileInfo file in rootInfo.GetFiles(rule.Pattern, SearchOption.TopDirectoryOnly))
-                    {
-                        if (!_policy.IsReparsePoint(file.FullName)) files.Add(file);
-                    }
-                }
-                catch { }
-                return files;
-            }
-
-            Stack<DirectoryInfo> pending = new Stack<DirectoryInfo>();
-            pending.Push(new DirectoryInfo(rule.RootPath));
-            string normalizedRoot = SafetyPolicy.Normalize(rule.RootPath);
-            while (pending.Count > 0)
-            {
-                DirectoryInfo directory = pending.Pop();
-                DirectoryInfo[] subdirectories = new DirectoryInfo[0];
-                FileInfo[] directoryFiles = new FileInfo[0];
-                try
-                {
-                    subdirectories = directory.GetDirectories();
-                    directoryFiles = directory.GetFiles();
-                }
-                catch { continue; }
-
-                foreach (FileInfo file in directoryFiles)
-                {
-                    if (!_policy.IsSafeDescendant(normalizedRoot, file.FullName) || _policy.IsReparsePoint(file.FullName)) continue;
-                    if (rule.Mode == CleanupMode.AllFiles || file.LastWriteTimeUtc < cutoff) files.Add(file);
-                }
-
-                foreach (DirectoryInfo subdirectory in subdirectories)
-                {
-                    if (!_policy.IsSafeDescendant(normalizedRoot, subdirectory.FullName)) continue;
-                    bool isDirectChild = String.Equals(subdirectory.Parent.FullName.TrimEnd('\\'), normalizedRoot, StringComparison.OrdinalIgnoreCase);
-                    if (isDirectChild && !String.IsNullOrEmpty(rule.ExcludedTopLevelName) &&
-                        String.Equals(subdirectory.Name, rule.ExcludedTopLevelName, StringComparison.OrdinalIgnoreCase)) continue;
-                    if (_policy.IsReparsePoint(subdirectory.FullName)) continue;
-                    pending.Push(subdirectory);
-                }
-            }
-            return files;
-        }
-
-        private void RemoveEmptyDirectories(CleanupRule rule, CleanResult result)
-        {
-            if (rule.Mode == CleanupMode.MatchingFiles || !Directory.Exists(rule.RootPath)) return;
-            DateTime cutoff = DateTime.UtcNow.AddHours(-Math.Max(1, rule.RetentionHours));
-            List<DirectoryInfo> directories = new List<DirectoryInfo>();
-            Stack<DirectoryInfo> pending = new Stack<DirectoryInfo>();
-            pending.Push(new DirectoryInfo(rule.RootPath));
-            string normalizedRoot = SafetyPolicy.Normalize(rule.RootPath);
-
-            while (pending.Count > 0)
-            {
-                DirectoryInfo directory = pending.Pop();
-                DirectoryInfo[] children;
-                try { children = directory.GetDirectories(); }
-                catch { continue; }
-                foreach (DirectoryInfo child in children)
-                {
-                    if (!_policy.IsSafeDescendant(normalizedRoot, child.FullName) || _policy.IsReparsePoint(child.FullName)) continue;
-                    bool isDirectChild = String.Equals(child.Parent.FullName.TrimEnd('\\'), normalizedRoot, StringComparison.OrdinalIgnoreCase);
-                    if (isDirectChild && !String.IsNullOrEmpty(rule.ExcludedTopLevelName) &&
-                        String.Equals(child.Name, rule.ExcludedTopLevelName, StringComparison.OrdinalIgnoreCase)) continue;
-                    directories.Add(child);
-                    pending.Push(child);
-                }
-            }
-
-            foreach (DirectoryInfo directory in directories.OrderByDescending(d => d.FullName.Length))
-            {
-                try
-                {
-                    if (rule.Mode == CleanupMode.OlderFiles && directory.LastWriteTimeUtc >= cutoff) continue;
-                    if (!directory.EnumerateFileSystemInfos().Any())
-                    {
-                        directory.Delete(false);
-                        result.RemovedDirectories++;
-                    }
-                }
-                catch { }
-            }
-        }
-
-        private static long GetCDriveFreeSpace()
-        {
-            try { return new DriveInfo("C").AvailableFreeSpace; }
-            catch { return 0L; }
-        }
-
-        public static bool RunSelfTest(string outputPath)
-        {
-            string root = Path.Combine(Path.GetTempPath(), "CDriveCacheCleanerSelfTest-" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(root);
-            bool passed = false;
-            string details = String.Empty;
-            try
-            {
-                string oldFile = Path.Combine(root, "old.tmp");
-                string recentFile = Path.Combine(root, "recent.tmp");
-                string excluded = Path.Combine(root, "keep");
-                Directory.CreateDirectory(excluded);
-                File.WriteAllText(oldFile, "old");
-                File.WriteAllText(recentFile, "recent");
-                File.WriteAllText(Path.Combine(excluded, "old-but-excluded.tmp"), "keep");
-                File.SetLastWriteTimeUtc(oldFile, DateTime.UtcNow.AddDays(-3));
-                File.SetLastWriteTimeUtc(recentFile, DateTime.UtcNow);
-                File.SetLastWriteTimeUtc(Path.Combine(excluded, "old-but-excluded.tmp"), DateTime.UtcNow.AddDays(-3));
-
-                CleanupTarget target = new CleanupTarget();
-                target.Name = "Self Test";
-                target.Selected = true;
-                CleanupRule rule = new CleanupRule(root, CleanupMode.OlderFiles);
-                rule.RetentionHours = 24;
-                rule.ExcludedTopLevelName = "keep";
-                target.Rules.Add(rule);
-
-                CleanerEngine engine = new CleanerEngine(new SafetyPolicy(root));
-                engine.Scan(new List<CleanupTarget> { target }, null);
-                CleanResult result = engine.Clean(new List<CleanupTarget> { target }, null);
-                SafetyPolicy policy = new SafetyPolicy(root);
-
-                passed = target.SizeBytes == 3L && !File.Exists(oldFile) && File.Exists(recentFile) &&
-                         File.Exists(Path.Combine(excluded, "old-but-excluded.tmp")) &&
-                         !policy.IsApprovedRoot(Path.GetPathRoot(root));
-                details = "old_deleted=" + (!File.Exists(oldFile)).ToString().ToLowerInvariant() +
-                          ", recent_kept=" + File.Exists(recentFile).ToString().ToLowerInvariant() +
-                          ", excluded_kept=" + File.Exists(Path.Combine(excluded, "old-but-excluded.tmp")).ToString().ToLowerInvariant() +
-                          ", root_rejected=" + (!policy.IsApprovedRoot(Path.GetPathRoot(root))).ToString().ToLowerInvariant() +
-                          ", skipped=" + result.SkippedItems.ToString(CultureInfo.InvariantCulture);
-            }
-            catch (Exception ex)
-            {
-                details = ex.ToString();
-            }
-            finally
-            {
-                try { Directory.Delete(root, true); }
-                catch { }
-            }
-
-            string json = "{\r\n  \"passed\": " + passed.ToString().ToLowerInvariant() +
-                          ",\r\n  \"details\": \"" + FormatUtil.Json(details) + "\"\r\n}";
-            File.WriteAllText(outputPath, json, new UTF8Encoding(false));
-            return passed;
-        }
-    }
 
     internal static class AppLog
     {
@@ -699,12 +474,18 @@ namespace CDriveCacheCleaner
         private Panel _progress;
         private List<CleanupTarget> _targets = new List<CleanupTarget>();
         private bool _busy;
+        private CancellationTokenSource _cancellation;
+        private bool _closeWhenIdle;
+        private Button _stopButton;
+        private Button _detailsButton;
+        private Button _exportButton;
+        private CleanResult _lastResult;
 
         public MainForm()
         {
-            Text = "C盘缓存清理器";
-            MinimumSize = new Size(860, 640);
-            Size = new Size(1000, 720);
+            Text = "C盘缓存清理器 · 1.1.0";
+            MinimumSize = new Size(980, 720);
+            Size = new Size(1200, 840);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Ink;
             Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
@@ -712,6 +493,10 @@ namespace CDriveCacheCleaner
             Icon = CreateAppIcon();
             BuildUi();
             Shown += delegate { BeginScan(); };
+            FormClosing += delegate(object sender, FormClosingEventArgs e)
+            {
+                if (_busy) { e.Cancel = true; _closeWhenIdle = true; StopOperation(); }
+            };
         }
 
         private void BuildUi()
@@ -733,7 +518,7 @@ namespace CDriveCacheCleaner
             badge.AutoSize = false;
             badge.Size = new Size(118, 29);
             badge.TextAlign = ContentAlignment.MiddleCenter;
-            badge.Text = "安全模式";
+            badge.Text = "确认后清理";
             badge.ForeColor = Teal;
             badge.BackColor = Color.FromArgb(61, 61, 59);
             badge.Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold);
@@ -760,7 +545,7 @@ namespace CDriveCacheCleaner
             cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33f));
             _reclaimValue = AddSummaryCard(cards, 0, "扫描可释放", "—", Teal);
             _selectedValue = AddSummaryCard(cards, 1, "本次已选择", "—", Amber);
-            _boundaryValue = AddSummaryCard(cards, 2, "安全边界", "保留最近 24 小时", Color.FromArgb(83, 83, 80));
+            _boundaryValue = AddSummaryCard(cards, 2, "临时文件策略", "保留最近 24 小时", Color.FromArgb(83, 83, 80));
             _reclaimValue.ForeColor = Highlight;
             _selectedValue.ForeColor = Highlight;
             _boundaryValue.Font = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
@@ -806,6 +591,11 @@ namespace CDriveCacheCleaner
             _scanButton.Dock = DockStyle.Right;
             _scanButton.Click += delegate { BeginScan(); };
             actions.Controls.Add(_scanButton);
+            _stopButton = MakeButton("停止操作", Pale, Teal, 104);
+            _stopButton.Dock = DockStyle.Right;
+            _stopButton.Enabled = false;
+            _stopButton.Click += delegate { StopOperation(); };
+            actions.Controls.Add(_stopButton);
             Controls.Add(actions);
 
             Panel content = new Panel();
@@ -817,11 +607,12 @@ namespace CDriveCacheCleaner
             safety.Dock = DockStyle.Right;
             safety.Width = 244;
             safety.BackColor = Pale;
-            safety.Padding = new Padding(20);
+            safety.Padding = new Padding(0);
+            safety.AutoScroll = true;
 
             Label safetyTitle = new Label();
             safetyTitle.AutoSize = true;
-            safetyTitle.Text = "清理护栏";
+            safetyTitle.Text = "清理规则";
             safetyTitle.ForeColor = Teal;
             safetyTitle.Font = new Font("Microsoft YaHei UI", 13f, FontStyle.Bold);
             safetyTitle.Location = new Point(20, 21);
@@ -829,28 +620,34 @@ namespace CDriveCacheCleaner
 
             Label safetyCopy = new Label();
             safetyCopy.AutoSize = false;
-            safetyCopy.Text = "✓ 不碰个人文件\r\n\r\n✓ 不清空回收站\r\n\r\n✓ 跳过占用或无权限项\r\n\r\n✓ 跳过链接目录\r\n\r\n✓ 清理前再次确认";
+            safetyCopy.Text = "✓ 确认扫描清单后清理\r\n✓ 保留近期临时文件\r\n✓ 跳过占用及链接文件\r\n✓ 诊断文件默认保留\r\n✓ 清理前再次确认";
             safetyCopy.ForeColor = Muted;
             safetyCopy.Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular);
             safetyCopy.Location = new Point(20, 62);
-            safetyCopy.Size = new Size(204, 150);
+            safetyCopy.Size = new Size(204, 90);
             safety.Controls.Add(safetyCopy);
 
             Label retentionLabel = new Label();
             retentionLabel.AutoSize = true;
             retentionLabel.Text = "临时文件保留时间";
             retentionLabel.ForeColor = Teal;
-            retentionLabel.Location = new Point(20, 218);
+            retentionLabel.Location = new Point(20, 158);
             safety.Controls.Add(retentionLabel);
 
             _retention = new ComboBox();
             _retention.DropDownStyle = ComboBoxStyle.DropDownList;
             _retention.FlatStyle = FlatStyle.Flat;
+            _retention.DrawMode = DrawMode.OwnerDrawFixed;
             _retention.BackColor = Color.FromArgb(43, 43, 43);
             _retention.ForeColor = Teal;
             _retention.Items.AddRange(new object[] { "24 小时", "72 小时", "7 天" });
+            _retention.DrawItem += delegate(object sender, DrawItemEventArgs e)
+            {
+                using (Brush background = new SolidBrush(Color.FromArgb(43, 43, 43))) e.Graphics.FillRectangle(background, e.Bounds);
+                if (e.Index >= 0) TextRenderer.DrawText(e.Graphics, _retention.Items[e.Index].ToString(), Font, e.Bounds, Teal, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+            };
             _retention.SelectedIndex = 0;
-            _retention.Location = new Point(20, 242);
+            _retention.Location = new Point(20, 182);
             _retention.Width = 196;
             _retention.SelectedIndexChanged += delegate { UpdateRetentionCard(); };
             safety.Controls.Add(_retention);
@@ -860,9 +657,22 @@ namespace CDriveCacheCleaner
             _lastRun.Text = "尚未执行清理";
             _lastRun.ForeColor = Muted;
             _lastRun.Font = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Regular);
-            _lastRun.Location = new Point(20, 286);
-            _lastRun.Size = new Size(198, 52);
+            _lastRun.Location = new Point(20, 218);
+            _lastRun.Size = new Size(198, 48);
             safety.Controls.Add(_lastRun);
+            _detailsButton = MakeButton("查看选中项明细", Pale, Teal, 196);
+            _detailsButton.Location = new Point(20, 270);
+            _detailsButton.Click += delegate { ShowDetails(); };
+            safety.Controls.Add(_detailsButton);
+            _exportButton = MakeButton("导出上次结果", Pale, Teal, 196);
+            _exportButton.Location = new Point(20, 320);
+            _exportButton.Enabled = false;
+            _exportButton.Click += delegate { ExportResult(); };
+            safety.Controls.Add(_exportButton);
+            Button feedback = MakeButton("反馈问题", Pale, Teal, 196);
+            feedback.Location = new Point(20, 370);
+            feedback.Click += delegate { Process.Start(new ProcessStartInfo("https://github.com/bogao6769-netizen/c-drive-cache-cleaner/issues/new/choose") { UseShellExecute = true }); };
+            safety.Controls.Add(feedback);
             content.Controls.Add(safety);
 
             Panel gridHost = new Panel();
@@ -871,6 +681,8 @@ namespace CDriveCacheCleaner
             _grid = CreateGrid();
             gridHost.Controls.Add(_grid);
             content.Controls.Add(gridHost);
+            content.Controls.SetChildIndex(gridHost, 0);
+            content.Controls.SetChildIndex(safety, 1);
             Controls.Add(content);
 
             // WinForms docks controls from the back of the collection. Keep the
@@ -929,7 +741,8 @@ namespace CDriveCacheCleaner
             grid.AutoGenerateColumns = false;
             grid.EnableHeadersVisualStyles = false;
             grid.ColumnHeadersHeight = 38;
-            grid.RowTemplate.Height = 42;
+            grid.RowTemplate.Height = 46;
+            grid.DefaultCellStyle.WrapMode = DataGridViewTriState.True;
             grid.ColumnHeadersDefaultCellStyle.BackColor = Ink;
             grid.ColumnHeadersDefaultCellStyle.ForeColor = Teal;
             grid.ColumnHeadersDefaultCellStyle.Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold);
@@ -951,6 +764,12 @@ namespace CDriveCacheCleaner
             grid.Columns.Add(TextColumn("Group", "类别", 80));
             grid.Columns.Add(TextColumn("Name", "缓存项目", 155));
             DataGridViewTextBoxColumn rule = TextColumn("Rule", "处理规则", 190);
+            grid.Columns["Name"].MinimumWidth = 140;
+            grid.Columns["Name"].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+            grid.Columns["Name"].FillWeight = 42;
+            rule.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+            rule.MinimumWidth = 150;
+            rule.FillWeight = 58;
             grid.Columns.Add(rule);
             DataGridViewTextBoxColumn size = TextColumn("Size", "可释放", 102);
             size.DefaultCellStyle.Font = new Font("Cascadia Mono", 9f, FontStyle.Bold);
@@ -965,6 +784,7 @@ namespace CDriveCacheCleaner
             grid.CellValueChanged += GridCellValueChanged;
             grid.CellFormatting += GridCellFormatting;
             grid.CellPainting += GridCellPainting;
+            grid.CellDoubleClick += delegate(object sender, DataGridViewCellEventArgs e) { if (e.RowIndex >= 0) ShowDetails(); };
             grid.CellMouseEnter += delegate(object sender, DataGridViewCellEventArgs e)
             {
                 if (e.RowIndex >= 0 && e.RowIndex < _targets.Count)
@@ -1030,25 +850,33 @@ namespace CDriveCacheCleaner
             if (_busy) return;
             SetBusy(true, "正在扫描已批准的缓存目录…");
             int hours = RetentionHours;
+            Dictionary<string, bool> previous = _targets.ToDictionary(t => t.Id, t => t.Selected);
+            _targets = new List<CleanupTarget>(); BindTargets();
+            _cancellation = new CancellationTokenSource();
+            CancellationToken token = _cancellation.Token;
             BackgroundWorker worker = new BackgroundWorker();
             worker.DoWork += delegate(object sender, DoWorkEventArgs e)
             {
                 List<CleanupTarget> targets = CleanerCatalog.Build(hours);
                 CleanerEngine engine = new CleanerEngine();
-                engine.Scan(targets, null);
+                engine.Scan(targets, null, token);
+                foreach (CleanupTarget target in targets)
+                    if (previous.ContainsKey(target.Id)) target.Selected = previous[target.Id];
                 e.Result = targets;
             };
             worker.RunWorkerCompleted += delegate(object sender, RunWorkerCompletedEventArgs e)
             {
                 if (e.Error != null)
                 {
-                    SetBusy(false, "扫描失败：" + e.Error.Message);
+                    SetBusy(false, e.Error is OperationCanceledException ? "扫描已停止，请重新扫描" : "扫描失败：" + e.Error.Message);
+                    EndOperation();
                     AppLog.Write("扫描失败：" + e.Error);
                     return;
                 }
                 _targets = (List<CleanupTarget>)e.Result;
                 BindTargets();
                 SetBusy(false, "扫描完成 · 勾选项目后开始清理");
+                EndOperation();
                 UpdateDriveMeter();
                 AppLog.Write("扫描完成，可释放 " + FormatUtil.Bytes(_targets.Sum(t => t.SizeBytes)));
             };
@@ -1142,30 +970,37 @@ namespace CDriveCacheCleaner
             if (confirmation != DialogResult.OK) return;
 
             SetBusy(true, "正在清理所选缓存…");
+            _cancellation = new CancellationTokenSource();
+            CancellationToken token = _cancellation.Token;
             BackgroundWorker worker = new BackgroundWorker();
             worker.DoWork += delegate(object sender, DoWorkEventArgs e)
             {
                 CleanerEngine engine = new CleanerEngine();
-                e.Result = engine.Clean(selected, delegate(string text) { AppLog.Write(text); });
+                e.Result = engine.Clean(selected, delegate(string text) { AppLog.Write(text); }, token);
             };
             worker.RunWorkerCompleted += delegate(object sender, RunWorkerCompletedEventArgs e)
             {
                 if (e.Error != null)
                 {
                     SetBusy(false, "清理失败：" + e.Error.Message);
+                    EndOperation();
                     AppLog.Write("清理失败：" + e.Error);
                     return;
                 }
                 CleanResult result = (CleanResult)e.Result;
-                _lastRun.Text = "上次清理  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm") + "\r\n释放 " + FormatUtil.Bytes(result.FreedBytes) +
-                                " · 跳过 " + result.SkippedItems.ToString(CultureInfo.InvariantCulture) + " 项";
-                AppLog.Write("清理完成，实际释放 " + FormatUtil.Bytes(result.FreedBytes) + "，删除文件 " + result.DeletedFiles + "，跳过 " + result.SkippedItems);
-                MessageBox.Show(this,
-                    "实际释放 " + FormatUtil.Bytes(result.FreedBytes) + "\r\n删除文件 " + result.DeletedFiles.ToString(CultureInfo.InvariantCulture) +
-                    " 个，移除空目录 " + result.RemovedDirectories.ToString(CultureInfo.InvariantCulture) +
-                    " 个，跳过 " + result.SkippedItems.ToString(CultureInfo.InvariantCulture) + " 项。",
-                    "清理完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                SetBusy(false, "清理完成，正在复核…");
+                _lastResult = result;
+                _exportButton.Enabled = true;
+                _lastRun.Text = "上次清理  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm") + "\r\n删除文件容量 " + FormatUtil.Bytes(result.DeletedBytes) +
+                                " · 跳过 " + result.SkippedItems.ToString(CultureInfo.InvariantCulture) + " 项\r\n结果：" + result.SummaryStatus;
+                AppLog.Write(result.SummaryStatus + "，删除文件容量 " + FormatUtil.Bytes(result.DeletedBytes) + "，删除文件 " + result.DeletedFiles + "，跳过 " + result.SkippedItems);
+                if (!_closeWhenIdle) MessageBox.Show(this,
+                    "预计容量：" + FormatUtil.Bytes(result.EstimatedBytes) + "\r\n已删除文件容量：" + FormatUtil.Bytes(result.DeletedBytes) +
+                    "\r\nC盘可用空间变化：" + (result.FreeAfter >= result.FreeBefore ? "+" : "-") + FormatUtil.Bytes(Math.Abs(result.FreeAfter - result.FreeBefore)) +
+                    "（受其他程序写入影响）\r\n删除 " + result.DeletedFiles + " 个文件，跳过 " + result.SkippedItems + " 项。\r\n" + result.ErrorMessage,
+                    "清理结果：" + result.SummaryStatus, MessageBoxButtons.OK, String.IsNullOrEmpty(result.ErrorMessage) ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                SetBusy(false, "处理结束，正在复核…");
+                EndOperation();
+                if (_closeWhenIdle) return;
                 BeginScan();
             };
             worker.RunWorkerAsync();
@@ -1180,7 +1015,73 @@ namespace CDriveCacheCleaner
             _retention.Enabled = !busy;
             _grid.Enabled = !busy;
             _cleanButton.Enabled = !busy && _targets.Any(t => t.Selected && t.SizeBytes > 0);
+            if (_stopButton != null) _stopButton.Enabled = busy;
+            if (_detailsButton != null) _detailsButton.Enabled = !busy && _targets.Count > 0;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
+        }
+
+        private void StopOperation()
+        {
+            if (_cancellation != null) _cancellation.Cancel();
+            _stopButton.Enabled = false;
+            _status.Text = "正在停止，将保留已完成结果…";
+        }
+
+        private void EndOperation()
+        {
+            if (_cancellation != null) { _cancellation.Dispose(); _cancellation = null; }
+            if (_closeWhenIdle) BeginInvoke(new Action(Close));
+        }
+
+        private void ExportResult()
+        {
+            if (_lastResult == null) return;
+            using (SaveFileDialog dialog = new SaveFileDialog { Filter = "CSV 报告|*.csv", FileName = "清理结果-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv" })
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                try { Report.Export(_lastResult, dialog.FileName); _status.Text = "结果已导出，用户目录已替换为 %USERPROFILE%"; }
+                catch (Exception ex) { MessageBox.Show(this, "导出失败：" + ex.Message); }
+            }
+        }
+
+        private void ShowDetails()
+        {
+            if (_busy || _grid.CurrentRow == null) return;
+            CleanupTarget target = _grid.CurrentRow.Tag as CleanupTarget;
+            if (target == null) return;
+            using (Form dialog = new Form())
+            {
+                dialog.Text = target.Name + " · 扫描明细"; dialog.Size = new Size(1100, 700);
+                dialog.StartPosition = FormStartPosition.CenterParent; dialog.BackColor = Pale; dialog.ForeColor = Teal; dialog.Font = Font;
+                DataGridView table = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false,
+                    RowHeadersVisible = false, BackgroundColor = Ink, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                    EnableHeadersVisualStyles = false, BorderStyle = BorderStyle.None };
+                table.ColumnHeadersDefaultCellStyle.BackColor = Pale; table.ColumnHeadersDefaultCellStyle.ForeColor = Highlight;
+                table.DefaultCellStyle.BackColor = Pale; table.DefaultCellStyle.ForeColor = Teal;
+                table.DefaultCellStyle.SelectionBackColor = Color.FromArgb(59, 59, 57); table.DefaultCellStyle.SelectionForeColor = Highlight;
+                table.Columns.Add("Path", "完整路径"); table.Columns.Add("Size", "大小"); table.Columns.Add("Decision", "处理规则 / 保留原因");
+                table.Columns[0].FillWeight = 65; table.Columns[1].FillWeight = 12; table.Columns[2].FillWeight = 23;
+                foreach (FileEntry entry in target.Entries.Take(5000)) table.Rows.Add(entry.Path, FormatUtil.Bytes(entry.Bytes), entry.Decision);
+                Label note = new Label { Dock = DockStyle.Top, Height = 62, Padding = new Padding(14), Text = target.Description + "\r\n待清理 " + target.CandidateCount +
+                    " 个 · 保留 " + target.ProtectedCount + " 项 · 读取问题 " + target.ScanErrors + " 项。界面最多展示 5000 条，可导出全部明细。" };
+                Button export = MakeButton("导出全部明细", Pale, Highlight, 160); export.Dock = DockStyle.Bottom;
+                export.Click += delegate
+                {
+                    using (SaveFileDialog save = new SaveFileDialog { Filter = "CSV 明细|*.csv", FileName = "扫描明细.csv" })
+                    {
+                        if (save.ShowDialog(dialog) != DialogResult.OK) return;
+                        try
+                        {
+                            StringBuilder csv = new StringBuilder("路径,字节,处理规则\r\n");
+                            foreach (FileEntry entry in target.Entries) csv.AppendLine(Report.Csv(Report.Redact(entry.Path)) + "," + entry.Bytes + "," + Report.Csv(entry.Decision));
+                            File.WriteAllText(save.FileName, csv.ToString(), new UTF8Encoding(true));
+                        }
+                        catch (Exception ex) { MessageBox.Show(dialog, "导出失败：" + ex.Message); }
+                    }
+                };
+                dialog.Controls.Add(table); dialog.Controls.Add(note); dialog.Controls.Add(export);
+                dialog.ShowDialog(this);
+            }
         }
 
         private void UpdateDriveMeter()

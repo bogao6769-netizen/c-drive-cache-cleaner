@@ -1,0 +1,66 @@
+name: Windows build, safety tests and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build, test and package
+        shell: powershell
+        run: .\package.ps1
+      - name: Upload verified package and test report
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-windows-package
+          path: |
+            dist/CDriveCacheCleaner.exe
+            artifacts/*
+            self-test.json
+          if-no-files-found: error
+  release:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: windows-2022
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-windows-package
+          path: verified
+      - name: Publish new version only (never overwrite existing release)
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $exe = Join-Path $PWD 'verified\dist\CDriveCacheCleaner.exe'
+          $version = [Reflection.AssemblyName]::GetAssemblyName($exe).Version.ToString(3)
+          $tag = "v$version"
+          $notes = "docs/RELEASE-$version.md"
+          if (-not (Test-Path -LiteralPath $notes)) { throw "Missing release notes: $notes" }
+          $existing = gh release list --limit 100 --json tagName | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read releases' }
+          if ($existing.tagName -contains $tag) { Write-Host "Release $tag exists; leaving it unchanged"; exit 0 }
+          gh release create $tag $exe "verified/artifacts/CDriveCacheCleaner-$tag-portable.zip" "verified/artifacts/SHA256SUMS.txt" --target $env:GITHUB_SHA --title "C 盘缓存清理器 $version" --notes-file $notes --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

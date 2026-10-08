@@ -1,0 +1,36 @@
+name: 问题反馈
+description: 报告扫描、清理或界面问题
+title: "[Bug] "
+body:
+  - type: input
+    id: version
+    attributes:
+      label: 软件版本
+      placeholder: 1.1.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Windows 版本、位数与显示缩放
+      placeholder: Windows 11 64 位，125% 缩放，普通用户运行
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤与实际结果
+      description: 请写明缓存分类；不要包含私人路径。涉及安全漏洞先阅读 SECURITY.md。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏截图或错误信息（可选）
+      description: 不要上传完整个人日志；先遮盖用户名和私人文件名。
